@@ -20,12 +20,14 @@ type View struct {
 	x0, y0, x1, y1 int
 	ox, oy         int
 	cx, cy         int
-	lines          [][]rune
+	lines          [][]cell
 	readOffset     int
 	readCache      string
 
 	tainted   bool       // marks if the viewBuffer must be updated
 	viewLines []viewLine // internal representation of the view's buffer
+
+	ei *escapeInterpreter // used to decode ESC sequences on Write
 
 	// BgColor and FgColor allow to configure the background and foreground
 	// colors of the View.
@@ -57,11 +59,34 @@ type View struct {
 	// If Autoscroll is true, the View will automatically scroll down when the
 	// text overflows. If true the view's y-origin will be ignored.
 	Autoscroll bool
+
+	// If Frame is true, Title allows to configure a title for the view.
+	Title string
+
+	// If Mask is true, the View will display the mask instead of the real
+	// content
+	Mask rune
 }
 
 type viewLine struct {
 	linesX, linesY int // coordinates relative to v.lines
-	line           []rune
+	line           []cell
+}
+
+type cell struct {
+	chr              rune
+	bgColor, fgColor Attribute
+}
+
+type lineType []cell
+
+// String returns a string from a given cell slice.
+func (l lineType) String() string {
+	str := ""
+	for _, c := range l {
+		str += string(c.chr)
+	}
+	return str
 }
 
 // newView returns a new View object.
@@ -74,6 +99,7 @@ func newView(name string, x0, y0, x1, y1 int) *View {
 		y1:      y1,
 		Frame:   true,
 		tainted: true,
+		ei:      newEscapeInterpreter(),
 	}
 	return v
 }
@@ -88,25 +114,42 @@ func (v *View) Name() string {
 	return v.name
 }
 
-// setRune writes a rune at the given point, relative to the view. It
-// checks if the position is valid and applies the view's colors, taking
-// into account if the cell must be highlighted.
-func (v *View) setRune(x, y int, ch rune) error {
+// setRune sets a rune at the given point relative to the view. It applies the
+// specified colors, taking into account if the cell must be highlighted. Also,
+// it checks if the position is valid.
+func (v *View) setRune(x, y int, ch rune, fgColor, bgColor Attribute) error {
 	maxX, maxY := v.Size()
 	if x < 0 || x >= maxX || y < 0 || y >= maxY {
 		return errors.New("invalid point")
 	}
 
-	var fgColor, bgColor Attribute
-	if v.Highlight && y == v.cy {
-		fgColor = v.SelFgColor
-		bgColor = v.SelBgColor
-	} else {
+	var (
+		ry, rcy int
+		err     error
+	)
+	if v.Highlight {
+		_, ry, err = v.realPosition(x, y)
+		if err != nil {
+			return err
+		}
+		_, rcy, err = v.realPosition(v.cx, v.cy)
+		if err != nil {
+			return err
+		}
+	}
+
+	if v.Mask != 0 {
 		fgColor = v.FgColor
 		bgColor = v.BgColor
+		ch = v.Mask
+	} else if v.Highlight && ry == rcy {
+		fgColor = v.SelFgColor
+		bgColor = v.SelBgColor
 	}
+
 	termbox.SetCell(v.x0+x+1, v.y0+y+1, ch,
 		termbox.Attribute(fgColor), termbox.Attribute(bgColor))
+
 	return nil
 }
 
@@ -162,18 +205,55 @@ func (v *View) Write(p []byte) (n int, err error) {
 			if nl > 0 {
 				v.lines[nl-1] = nil
 			} else {
-				v.lines = make([][]rune, 1)
+				v.lines = make([][]cell, 1)
 			}
 		default:
+			cells := v.parseInput(ch)
+			if cells == nil {
+				continue
+			}
+
 			nl := len(v.lines)
 			if nl > 0 {
-				v.lines[nl-1] = append(v.lines[nl-1], ch)
+				v.lines[nl-1] = append(v.lines[nl-1], cells...)
 			} else {
-				v.lines = append(v.lines, []rune{ch})
+				v.lines = append(v.lines, cells)
 			}
 		}
 	}
 	return len(p), nil
+}
+
+// parseInput parses char by char the input written to the View. It returns nil
+// while processing ESC sequences. Otherwise, it returns a cell slice that
+// contains the processed data.
+func (v *View) parseInput(ch rune) []cell {
+	cells := []cell{}
+
+	isEscape, err := v.ei.parseOne(ch)
+	if err != nil {
+		for _, r := range v.ei.runes() {
+			c := cell{
+				fgColor: v.FgColor,
+				bgColor: v.BgColor,
+				chr:     r,
+			}
+			cells = append(cells, c)
+		}
+		v.ei.reset()
+	} else {
+		if isEscape {
+			return nil
+		}
+		c := cell{
+			fgColor: v.ei.curFgColor,
+			bgColor: v.ei.curBgColor,
+			chr:     ch,
+		}
+		cells = append(cells, c)
+	}
+
+	return cells
 }
 
 // Read reads data into p. It returns the number of bytes read into p.
@@ -250,14 +330,24 @@ func (v *View) draw() error {
 			break
 		}
 		x := 0
-		for j, ch := range vline.line {
+		for j, c := range vline.line {
 			if j < v.ox {
 				continue
 			}
 			if x >= maxX {
 				break
 			}
-			if err := v.setRune(x, y, ch); err != nil {
+
+			fgColor := c.fgColor
+			if fgColor == ColorDefault {
+				fgColor = v.FgColor
+			}
+			bgColor := c.bgColor
+			if bgColor == ColorDefault {
+				bgColor = v.BgColor
+			}
+
+			if err := v.setRune(x, y, c.chr, fgColor, bgColor); err != nil {
 				return err
 			}
 			x++
@@ -313,117 +403,22 @@ func (v *View) clearRunes() {
 	}
 }
 
-// writeRune writes a rune into the view's internal buffer, at the
-// position corresponding to the point (x, y). The length of the internal
-// buffer is increased if the point is out of bounds. Overwrite mode is
-// governed by the value of View.overwrite.
-func (v *View) writeRune(x, y int, ch rune) error {
-	v.tainted = true
-
-	x, y, err := v.realPosition(x, y)
-	if err != nil {
-		return err
-	}
-
-	if x < 0 || y < 0 {
-		return errors.New("invalid point")
-	}
-
-	if y >= len(v.lines) {
-		s := make([][]rune, y-len(v.lines)+1)
-		v.lines = append(v.lines, s...)
-	}
-
-	olen := len(v.lines[y])
-	if x >= len(v.lines[y]) {
-		s := make([]rune, x-len(v.lines[y])+1)
-		v.lines[y] = append(v.lines[y], s...)
-	}
-
-	if !v.Overwrite && x < olen {
-		v.lines[y] = append(v.lines[y], '\x00')
-		copy(v.lines[y][x+1:], v.lines[y][x:])
-	}
-	v.lines[y][x] = ch
-	return nil
-}
-
-// deleteRune removes a rune from the view's internal buffer, at the
-// position corresponding to the point (x, y).
-func (v *View) deleteRune(x, y int) error {
-	v.tainted = true
-
-	x, y, err := v.realPosition(x, y)
-	if err != nil {
-		return err
-	}
-
-	if x < 0 || y < 0 || y >= len(v.lines) || x >= len(v.lines[y]) {
-		return errors.New("invalid point")
-	}
-	v.lines[y] = append(v.lines[y][:x], v.lines[y][x+1:]...)
-	return nil
-}
-
-// mergeLines merges the lines "y" and "y+1" if possible.
-func (v *View) mergeLines(y int) error {
-	v.tainted = true
-
-	_, y, err := v.realPosition(0, y)
-	if err != nil {
-		return err
-	}
-
-	if y < 0 || y >= len(v.lines) {
-		return errors.New("invalid point")
-	}
-
-	if y < len(v.lines)-1 { // otherwise we don't need to merge anything
-		v.lines[y] = append(v.lines[y], v.lines[y+1]...)
-		v.lines = append(v.lines[:y+1], v.lines[y+2:]...)
-	}
-	return nil
-}
-
-// breakLine breaks a line of the internal buffer at the position corresponding
-// to the point (x, y).
-func (v *View) breakLine(x, y int) error {
-	v.tainted = true
-
-	x, y, err := v.realPosition(x, y)
-	if err != nil {
-		return err
-	}
-
-	if y < 0 || y >= len(v.lines) {
-		return errors.New("invalid point")
-	}
-
-	var left, right []rune
-	if x < len(v.lines[y]) { // break line
-		left = make([]rune, len(v.lines[y][:x]))
-		copy(left, v.lines[y][:x])
-		right = make([]rune, len(v.lines[y][x:]))
-		copy(right, v.lines[y][x:])
-	} else { // new empty line
-		left = v.lines[y]
-	}
-
-	lines := make([][]rune, len(v.lines)+1)
-	lines[y] = left
-	lines[y+1] = right
-	copy(lines, v.lines[:y])
-	copy(lines[y+2:], v.lines[y+1:])
-	v.lines = lines
-	return nil
-}
-
 // Buffer returns a string with the contents of the view's internal
-// buffer
+// buffer.
 func (v *View) Buffer() string {
 	str := ""
 	for _, l := range v.lines {
-		str += string(l) + "\n"
+		str += lineType(l).String() + "\n"
+	}
+	return strings.Replace(str, "\x00", " ", -1)
+}
+
+// ViewBuffer returns a string with the contents of the view's buffer that is
+// shown to the user.
+func (v *View) ViewBuffer() string {
+	str := ""
+	for _, l := range v.viewLines {
+		str += lineType(l.line).String() + "\n"
 	}
 	return strings.Replace(str, "\x00", " ", -1)
 }
@@ -439,7 +434,8 @@ func (v *View) Line(y int) (string, error) {
 	if y < 0 || y >= len(v.lines) {
 		return "", errors.New("invalid point")
 	}
-	return string(v.lines[y]), nil
+
+	return lineType(v.lines[y]).String(), nil
 }
 
 // Word returns a string with the word of the view's internal buffer
@@ -453,20 +449,22 @@ func (v *View) Word(x, y int) (string, error) {
 	if x < 0 || y < 0 || y >= len(v.lines) || x >= len(v.lines[y]) {
 		return "", errors.New("invalid point")
 	}
-	l := string(v.lines[y])
-	nl := strings.LastIndexFunc(l[:x], indexFunc)
+
+	str := lineType(v.lines[y]).String()
+
+	nl := strings.LastIndexFunc(str[:x], indexFunc)
 	if nl == -1 {
 		nl = 0
 	} else {
 		nl = nl + 1
 	}
-	nr := strings.IndexFunc(l[x:], indexFunc)
+	nr := strings.IndexFunc(str[x:], indexFunc)
 	if nr == -1 {
-		nr = len(l)
+		nr = len(str)
 	} else {
 		nr = nr + x
 	}
-	return string(l[nl:nr]), nil
+	return string(str[nl:nr]), nil
 }
 
 // indexFunc allows to split lines by words taking into account spaces

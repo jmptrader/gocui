@@ -10,14 +10,11 @@ import (
 	"io"
 	"log"
 	"os"
-	"runtime"
 
 	"github.com/jroimartin/gocui"
 )
 
 func main() {
-	runtime.LockOSThread()
-
 	g := gocui.NewGui()
 	if err := g.Init(); err != nil {
 		log.Fatalln(err)
@@ -28,10 +25,9 @@ func main() {
 	if err := initKeybindings(g); err != nil {
 		log.Fatalln(err)
 	}
-	g.ShowCursor = true
+	g.Cursor = true
 
-	err := g.MainLoop()
-	if err != nil && err != gocui.Quit {
+	if err := g.MainLoop(); err != nil && err != gocui.ErrQuit {
 		log.Fatalln(err)
 	}
 }
@@ -40,7 +36,7 @@ func layout(g *gocui.Gui) error {
 	maxX, _ := g.Size()
 
 	if v, err := g.SetView("legend", maxX-23, 0, maxX-1, 5); err != nil {
-		if err != gocui.ErrorUnkView {
+		if err != gocui.ErrUnknownView {
 			return err
 		}
 		fmt.Fprintln(v, "KEYBINDINGS")
@@ -50,10 +46,10 @@ func layout(g *gocui.Gui) error {
 	}
 
 	if v, err := g.SetView("stdin", 0, 0, 80, 35); err != nil {
-		if err != gocui.ErrorUnkView {
+		if err != gocui.ErrUnknownView {
 			return err
 		}
-		if err := g.SetCurrentView("stdin"); err != nil {
+		if _, err := g.SetCurrentView("stdin"); err != nil {
 			return err
 		}
 		dumper := hex.Dumper(v)
@@ -91,7 +87,7 @@ func initKeybindings(g *gocui.Gui) error {
 }
 
 func quit(g *gocui.Gui, v *gocui.View) error {
-	return gocui.Quit
+	return gocui.ErrQuit
 }
 
 func autoscroll(g *gocui.Gui, v *gocui.View) error {

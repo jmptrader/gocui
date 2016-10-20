@@ -12,7 +12,7 @@ import (
 	"github.com/jroimartin/gocui"
 )
 
-const delta = 2
+const delta = 1
 
 var (
 	views   = []string{}
@@ -21,8 +21,6 @@ var (
 )
 
 func main() {
-	var err error
-
 	g := gocui.NewGui()
 	if err := g.Init(); err != nil {
 		log.Panicln(err)
@@ -30,6 +28,9 @@ func main() {
 	defer g.Close()
 
 	g.SetLayout(layout)
+	g.Highlight = true
+	g.SelFgColor = gocui.ColorRed
+
 	if err := initKeybindings(g); err != nil {
 		log.Panicln(err)
 	}
@@ -37,23 +38,24 @@ func main() {
 		log.Panicln(err)
 	}
 
-	err = g.MainLoop()
-	if err != nil && err != gocui.Quit {
+	if err := g.MainLoop(); err != nil && err != gocui.ErrQuit {
 		log.Panicln(err)
 	}
 }
 
 func layout(g *gocui.Gui) error {
 	maxX, _ := g.Size()
-	v, err := g.SetView("legend", maxX-22, 0, maxX-1, 6)
+	v, err := g.SetView("legend", maxX-25, 0, maxX-1, 8)
 	if err != nil {
-		if err != gocui.ErrorUnkView {
+		if err != gocui.ErrUnknownView {
 			return err
 		}
 		fmt.Fprintln(v, "KEYBINDINGS")
 		fmt.Fprintln(v, "Space: New View")
 		fmt.Fprintln(v, "Tab: Next View")
 		fmt.Fprintln(v, "← ↑ → ↓: Move View")
+		fmt.Fprintln(v, "Backspace: Delete View")
+		fmt.Fprintln(v, "t: Set view on top")
 		fmt.Fprintln(v, "^C: Exit")
 	}
 	return nil
@@ -105,11 +107,14 @@ func initKeybindings(g *gocui.Gui) error {
 		}); err != nil {
 		return err
 	}
+	if err := g.SetKeybinding("", 't', gocui.ModNone, ontop); err != nil {
+		return err
+	}
 	return nil
 }
 
 func quit(g *gocui.Gui, v *gocui.View) error {
-	return gocui.Quit
+	return gocui.ErrQuit
 }
 
 func newView(g *gocui.Gui) error {
@@ -117,23 +122,14 @@ func newView(g *gocui.Gui) error {
 	name := fmt.Sprintf("v%v", idxView)
 	v, err := g.SetView(name, maxX/2-5, maxY/2-5, maxX/2+5, maxY/2+5)
 	if err != nil {
-		if err != gocui.ErrorUnkView {
+		if err != gocui.ErrUnknownView {
 			return err
 		}
 		v.Wrap = true
 		fmt.Fprintln(v, strings.Repeat(name+" ", 30))
 	}
-	if err := g.SetCurrentView(name); err != nil {
+	if _, err := g.SetCurrentView(name); err != nil {
 		return err
-	}
-	v.BgColor = gocui.ColorRed
-
-	if curView >= 0 {
-		cv, err := g.View(views[curView])
-		if err != nil {
-			return err
-		}
-		cv.BgColor = g.BgColor
 	}
 
 	views = append(views, name)
@@ -161,21 +157,8 @@ func nextView(g *gocui.Gui, disableCurrent bool) error {
 		next = 0
 	}
 
-	nv, err := g.View(views[next])
-	if err != nil {
+	if _, err := g.SetCurrentView(views[next]); err != nil {
 		return err
-	}
-	if err := g.SetCurrentView(views[next]); err != nil {
-		return err
-	}
-	nv.BgColor = gocui.ColorRed
-
-	if disableCurrent && len(views) > 1 {
-		cv, err := g.View(views[curView])
-		if err != nil {
-			return err
-		}
-		cv.BgColor = g.BgColor
 	}
 
 	curView = next
@@ -192,4 +175,9 @@ func moveView(g *gocui.Gui, v *gocui.View, dx, dy int) error {
 		return err
 	}
 	return nil
+}
+
+func ontop(g *gocui.Gui, v *gocui.View) error {
+	_, err := g.SetViewOnTop(views[curView])
+	return err
 }

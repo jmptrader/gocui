@@ -4,14 +4,11 @@
 
 package gocui
 
+import "errors"
+
 const maxInt = int(^uint(0) >> 1)
 
-// Edit allows to define the editor that manages the edition mode,
-// including keybindings or cursor behaviour. DefaultEditor is used by
-// default.
-var Edit = EditorFunc(DefaultEditor)
-
-// Objects implementing the Editor interface can be used as gocui editors.
+// Editor interface must be satisfied by gocui editors.
 type Editor interface {
 	Edit(v *View, key Key, ch rune, mod Modifier)
 }
@@ -26,8 +23,11 @@ func (f EditorFunc) Edit(v *View, key Key, ch rune, mod Modifier) {
 	f(v, key, ch, mod)
 }
 
-// DefaultEditor is used as the default gocui editor.
-func DefaultEditor(v *View, key Key, ch rune, mod Modifier) {
+// DefaultEditor is the default editor.
+var DefaultEditor Editor = EditorFunc(simpleEditor)
+
+// simpleEditor is used as the default gocui editor.
+func simpleEditor(v *View, key Key, ch rune, mod Modifier) {
 	switch {
 	case ch != 0 && mod == 0:
 		v.EditWrite(ch)
@@ -159,7 +159,7 @@ func (v *View) MoveCursor(dx, dy int, writeMode bool) {
 				v.ox = 0
 			}
 			v.cx = 0
-			cy += 1
+			cy++
 		} else { // vertical movement
 			if curLineWidth > 0 { // move cursor to the EOL
 				if v.Wrap {
@@ -185,7 +185,7 @@ func (v *View) MoveCursor(dx, dy int, writeMode bool) {
 		}
 	} else if cx < 0 {
 		if !v.Wrap && v.ox > 0 { // move origin to the left
-			v.ox -= 1
+			v.ox--
 		} else { // move to previous line
 			if prevLineWidth > 0 {
 				if !v.Wrap { // set origin so the EOL is visible
@@ -203,14 +203,14 @@ func (v *View) MoveCursor(dx, dy int, writeMode bool) {
 				}
 				v.cx = 0
 			}
-			cy -= 1
+			cy--
 		}
 	} else { // stay on the same line
 		if v.Wrap {
 			v.cx = cx
 		} else {
 			if cx >= maxX {
-				v.ox += 1
+				v.ox++
 			} else {
 				v.cx = cx
 			}
@@ -219,12 +219,123 @@ func (v *View) MoveCursor(dx, dy int, writeMode bool) {
 
 	// adjust cursor's y position and view's y origin
 	if cy >= maxY {
-		v.oy += 1
+		v.oy++
 	} else if cy < 0 {
 		if v.oy > 0 {
-			v.oy -= 1
+			v.oy--
 		}
 	} else {
 		v.cy = cy
 	}
+}
+
+// writeRune writes a rune into the view's internal buffer, at the
+// position corresponding to the point (x, y). The length of the internal
+// buffer is increased if the point is out of bounds. Overwrite mode is
+// governed by the value of View.overwrite.
+func (v *View) writeRune(x, y int, ch rune) error {
+	v.tainted = true
+
+	x, y, err := v.realPosition(x, y)
+	if err != nil {
+		return err
+	}
+
+	if x < 0 || y < 0 {
+		return errors.New("invalid point")
+	}
+
+	if y >= len(v.lines) {
+		s := make([][]cell, y-len(v.lines)+1)
+		v.lines = append(v.lines, s...)
+	}
+
+	olen := len(v.lines[y])
+	if x >= len(v.lines[y]) {
+		s := make([]cell, x-len(v.lines[y])+1)
+		v.lines[y] = append(v.lines[y], s...)
+	}
+
+	c := cell{
+		fgColor: v.FgColor,
+		bgColor: v.BgColor,
+	}
+	if !v.Overwrite || (v.Overwrite && x >= olen-1) {
+		c.chr = '\x00'
+		v.lines[y] = append(v.lines[y], c)
+		copy(v.lines[y][x+1:], v.lines[y][x:])
+	}
+	c.chr = ch
+	v.lines[y][x] = c
+	return nil
+}
+
+// deleteRune removes a rune from the view's internal buffer, at the
+// position corresponding to the point (x, y).
+func (v *View) deleteRune(x, y int) error {
+	v.tainted = true
+
+	x, y, err := v.realPosition(x, y)
+	if err != nil {
+		return err
+	}
+
+	if x < 0 || y < 0 || y >= len(v.lines) || x >= len(v.lines[y]) {
+		return errors.New("invalid point")
+	}
+	v.lines[y] = append(v.lines[y][:x], v.lines[y][x+1:]...)
+	return nil
+}
+
+// mergeLines merges the lines "y" and "y+1" if possible.
+func (v *View) mergeLines(y int) error {
+	v.tainted = true
+
+	_, y, err := v.realPosition(0, y)
+	if err != nil {
+		return err
+	}
+
+	if y < 0 || y >= len(v.lines) {
+		return errors.New("invalid point")
+	}
+
+	if y < len(v.lines)-1 { // otherwise we don't need to merge anything
+		v.lines[y] = append(v.lines[y], v.lines[y+1]...)
+		v.lines = append(v.lines[:y+1], v.lines[y+2:]...)
+	}
+	return nil
+}
+
+// breakLine breaks a line of the internal buffer at the position corresponding
+// to the point (x, y).
+func (v *View) breakLine(x, y int) error {
+	v.tainted = true
+
+	x, y, err := v.realPosition(x, y)
+	if err != nil {
+		return err
+	}
+
+	if y < 0 || y >= len(v.lines) {
+		return errors.New("invalid point")
+	}
+
+	var left, right []cell
+	if x < len(v.lines[y]) { // break line
+		left = make([]cell, len(v.lines[y][:x]))
+		copy(left, v.lines[y][:x])
+		right = make([]cell, len(v.lines[y][x:]))
+		copy(right, v.lines[y][x:])
+	} else { // new empty line
+		left = v.lines[y]
+	}
+
+	lines := make([][]cell, len(v.lines)+1)
+	lines[y] = left
+	lines[y+1] = right
+	copy(lines, v.lines[:y])
+	copy(lines[y+2:], v.lines[y+1:])
+	v.lines = lines
+	return nil
 }
